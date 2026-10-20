@@ -1,6 +1,6 @@
 # Zoom Vanish
 
-Vanish from a Zoom call and come back, on Debian. Optionally dissolve into dust
+Vanish from a Zoom call and come back, on Debian. Optionally crumble into ash
 on the way out, and trigger it by waving goodbye or snapping your fingers.
 
 Zoom's desktop app can't be modified like a browser tab, so this works one
@@ -57,13 +57,14 @@ setup.sh creates both shortcuts on GNOME and XFCE. On other desktops, bind
 `zoom-vanish --quit` stops it.
 
 Messages appear as desktop notifications; details go to
-`~/.local/share/zoom-vanish/zoom-vanish.log`.
+`~/.local/share/zoom-vanish/zoom-vanish.log`, including speed figures every
+15 seconds and after each vanish, which show whether your computer keeps up.
 
 ### Zoom virtual backgrounds and filters
 
 Zoom applies its own effects on top of whatever Vanish Cam sends, so you can
 keep using them. With a virtual background on, vanishing leaves just the
-virtual background, and the room photo never shows. During the dust
+virtual background, and the room photo never shows. During the ash
 animation, Zoom's background detection may handle the particles unevenly.
 Check it in Zoom's video preview first.
 
@@ -76,7 +77,7 @@ first, so the webcam is free). Then these keys work in the terminal:
 |---|---|
 | `c` | capture the room |
 | `v` / space | vanish / appear |
-| `d` | dust effect on / off |
+| `d` | ash effect on / off |
 | `w` | goodbye-wave detection on / off |
 | `s` | finger-snap detection on / off |
 | `q` | quit |
@@ -125,12 +126,20 @@ zoom-vanish --snap --snap-sensitivity 1.5           # triggers more easily
 zoom-vanish --snap --snap-sensitivity 0.7           # fewer false triggers
 ```
 
-## How the dust effect finds you
+## The ash effect
+
+When you vanish, a ragged front crosses you from left to right. Just before it
+reaches each spot, that spot greys into ash, then breaks off as flakes and fine
+dust that the wind carries away, swirling as it fades. Coming back plays it in
+reverse: the ash blows in and reforms you. It takes 4 seconds
+(`--duration` changes that).
+
+### How it finds you
 
 No AI model: it compares each frame with the empty-room photo, and whatever
 differs is you. That keeps it fast and offline, with these limits:
 
-- Parts of you the same color as the wall behind you get no dust (they still
+- Parts of you the same color as the wall behind you make no ash (they still
   disappear, just without particles).
 - If the camera moves or the lighting changes a lot after the room photo, it
   may not find you, and falls back to a plain fade. Press Ctrl+Alt+C to
@@ -139,7 +148,7 @@ differs is you. That keeps it fast and offline, with these limits:
   the room photo looks brighter or darker than the live picture, lock
   exposure: `v4l2-ctl -d /dev/video0 --list-ctrls` shows the names; usually
   `v4l2-ctl -d /dev/video0 -c auto_exposure=1`.
-- `--threshold` (default 26): raise it if random background spots turn to dust,
+- `--threshold` (default 26): raise it if random background spots turn to ash,
   lower it if parts of you are missed.
 
 ## Options
@@ -149,8 +158,8 @@ zoom-vanish --help
 ```
 
 Turn triggers on at start with `--wave` and/or `--snap`. Others: `--width/--height/--fps` (default 1280x720 at 30; try
-`--width 960 --height 540` if the dust animation stutters), `--duration`
-(dust length, default 2.6 s), `--countdown`, `--no-dust`.
+`--width 960 --height 540` if the ash animation stutters), `--duration`
+(ash length, default 4 s), `--countdown`, `--no-dust`.
 
 ### How it recognises a place
 

@@ -150,88 +150,154 @@ class Crossfade:
         return out, p >= 1.0
 
 
-class Dissolve:
-    """Dust effect: you break apart into drifting particles, or reassemble.
+def fractal_noise(rng, h, w, octaves=((96, 0.45), (40, 0.3), (14, 0.25))):
+    """Smooth blotchy noise in 0..1 (a few layers of upscaled random grids)."""
+    acc = np.zeros((h, w), np.float32)
+    for cell, weight in octaves:
+        grid = rng.random((h // cell + 3, w // cell + 3)).astype(np.float32)
+        acc += weight * cv2.resize(grid, (w, h), interpolation=cv2.INTER_CUBIC)
+    lo, hi = float(acc.min()), float(acc.max())
+    return (acc - lo) / max(1e-6, hi - lo)
 
-    A trigger time is assigned to every pixel (a left to right sweep with some
-    low-frequency noise). When a pixel's time comes, it detaches as a particle
-    that drifts right and upward, fades, and turns dusty. Appearing plays the
-    same animation backwards.
+
+class Ash:
+    """Disintegration into ash, in the style of the famous superhero-film snap.
+
+    1. A ragged, blotchy front crosses you, starting on the side the wind
+       comes from (left) and slightly from the top.
+    2. Just before the front reaches a spot, that spot greys and darkens into
+       ash.
+    3. Then it breaks off as flakes and fine dust that the wind carries right
+       and upward, swirling, fading as it goes.
+    Appearing plays it backwards: the ash swirls in and reforms you.
     """
 
-    SWEEP_FRAC = 0.62   # share of the duration spent sweeping across you
-    MAX_PARTICLES = 45000
-    DUST_COLOR = np.array([62, 78, 96], dtype=np.float32)  # BGR, dusty brown-gray
+    ASH = np.array([52, 58, 66], dtype=np.float32)   # BGR: charcoal with a little brown
+    LEAD = 0.45                                       # seconds of greying before breaking off
+    MAX_PARTICLES = 26000
 
-    def __init__(self, snapshot, mask, direction, duration=2.6, seed=None):
+    def __init__(self, snapshot, mask, direction, duration=4.0, seed=None):
         rng = np.random.default_rng(seed)
         h, w = mask.shape
+        self.h, self.w = h, w
         self.direction = direction
         self.duration = duration
+        self.sweep = duration * 0.5          # time for the front to cross you
+        self.life_max = duration - self.sweep
         self.start = time.monotonic()
-        self.w, self.h = w, h
-        self.life = duration * (1.0 - self.SWEEP_FRAC)
         scale = w / 1280.0
 
-        cols = np.nonzero(mask.any(axis=0))[0]
-        x0, x1 = (cols.min(), cols.max()) if cols.size else (0, w - 1)
-        ramp = np.clip((np.arange(w, dtype=np.float32) - x0) / max(1, x1 - x0), 0, 1)
-        coarse = rng.random((h // 24 + 2, w // 24 + 2)).astype(np.float32)
-        noise = cv2.resize(coarse, (w, h), interpolation=cv2.INTER_CUBIC)
-        sweep = np.clip(0.65 * ramp[None, :] + 0.35 * noise, 0, 1)
-        self.trigger = sweep * (duration * self.SWEEP_FRAC)
+        # Trigger time for every pixel.
+        ys_m, xs_m = np.nonzero(mask)
+        if xs_m.size:
+            x0, x1, y0, y1 = xs_m.min(), xs_m.max(), ys_m.min(), ys_m.max()
+        else:
+            x0, x1, y0, y1 = 0, w - 1, 0, h - 1
+        ramp_x = np.clip((np.arange(w, dtype=np.float32) - x0) / max(1, x1 - x0), 0, 1)
+        ramp_y = np.clip((np.arange(h, dtype=np.float32) - y0) / max(1, y1 - y0), 0, 1)
+        noise = fractal_noise(rng, h, w)
+        raw = 0.5 * ramp_x[None, :] + 0.4 * noise + 0.1 * ramp_y[:, None]
+        if xs_m.size:  # stretch so the front starts at once and ends on time
+            lo, hi = float(raw[mask].min()), float(raw[mask].max())
+            raw = (raw - lo) / max(1e-6, hi - lo)
+        self.trigger = np.clip(raw, 0, 1).astype(np.float32) * self.sweep
 
-        stride = 3 if w >= 960 else 2
-        ys, xs = np.nonzero(mask[::stride, ::stride])
-        ys, xs = ys * stride, xs * stride
+        # Particles, sampled on a half-resolution grid.
+        half = mask[::2, ::2]
+        ys, xs = np.nonzero(half)
         if ys.size > self.MAX_PARTICLES:
             pick = rng.choice(ys.size, self.MAX_PARTICLES, replace=False)
             ys, xs = ys[pick], xs[pick]
         n = ys.size
         self.count = n
-        self.x0 = xs.astype(np.float32)
-        self.y0 = ys.astype(np.float32)
-        self.color = snapshot[ys, xs].astype(np.float32)
-        self.t0 = self.trigger[ys, xs]
-        self.vx = rng.uniform(70, 260, n).astype(np.float32) * scale
-        self.vy = rng.uniform(-170, -25, n).astype(np.float32) * scale
-        self.ax = rng.uniform(30, 120, n).astype(np.float32) * scale
-        self.ay = rng.uniform(-60, 10, n).astype(np.float32) * scale
+        fy, fx = ys * 2, xs * 2
+        self.x0 = fx.astype(np.float32)
+        self.y0 = fy.astype(np.float32)
+        base = snapshot[fy, fx].astype(np.float32)
+        grey = base.mean(axis=1, keepdims=True)
+        ashen = 0.35 * grey + 0.65 * self.ASH
+        self.c_start = 0.4 * base + 0.6 * ashen   # already greyed when it breaks off
+        self.c_end = ashen * rng.uniform(0.8, 1.15, (n, 1)).astype(np.float32)
+        self.t0 = self.trigger[fy, fx]
+        self.life = rng.uniform(0.55, 1.0, n).astype(np.float32) * self.life_max
+        self.vx = rng.uniform(110, 300, n).astype(np.float32) * scale
+        self.vy = rng.uniform(-120, -5, n).astype(np.float32) * scale
+        self.ax = rng.uniform(40, 160, n).astype(np.float32) * scale
+        self.ay = rng.uniform(-50, 15, n).astype(np.float32) * scale
+        self.swirl_amp = rng.uniform(8, 40, n).astype(np.float32) * scale
+        self.swirl_freq = rng.uniform(2.5, 7.0, n).astype(np.float32)
         self.phase = rng.uniform(0, 2 * np.pi, n).astype(np.float32)
-        self.wobble = rng.uniform(2, 9, n).astype(np.float32) * scale
-        self.size = 2 if w >= 960 else 1
+        self.flake = rng.random(n) < 0.3   # bigger pieces; the rest is fine dust
+
+    def _particles(self, t_eff):
+        age = t_eff - self.t0
+        act = (age > 0) & (age < self.life)
+        if not act.any():
+            return None
+        a = age[act]
+        px = self.x0[act] + self.vx[act] * a + 0.5 * self.ax[act] * a * a \
+            + 0.4 * self.swirl_amp[act] * np.sin(self.phase[act] + self.swirl_freq[act] * a)
+        py = self.y0[act] + self.vy[act] * a + 0.5 * self.ay[act] * a * a \
+            + self.swirl_amp[act] * np.sin(self.phase[act] * 1.7 + self.swirl_freq[act] * a)
+        frac = a / self.life[act]
+        mix = np.clip(frac * 3.0, 0, 1)[:, None]          # turns fully to ash quickly
+        col = self.c_start[act] * (1 - mix) + self.c_end[act] * mix
+        alpha = np.clip(1.0 - frac, 0, 1) ** 1.6
+        return px, py, col, alpha, self.flake[act]
 
     def render(self, live, room, live_region, now):
         t = now - self.start
         done = t >= self.duration
         t_eff = t if self.direction == "out" else self.duration - t
+        out = room.copy()
 
-        # Inside your outline, whatever the sweep has not reached yet stays live
-        # video. Outside it the live picture and the room photo look the same.
+        # The part of you the front has not reached yet: live video, greying
+        # into ash just before it breaks off.
         solid = live_region & (self.trigger > t_eff)
-        out = np.where(solid[..., None], live, room)
+        x0, y0, bw, bh = cv2.boundingRect(solid.view(np.uint8))
+        if bw and bh:
+            y1, x1 = y0 + bh, x0 + bw
+            s = solid[y0:y1, x0:x1]
+            pix = live[y0:y1, x0:x1]
+            k = np.clip(1.0 - (self.trigger[y0:y1, x0:x1] - t_eff) * (1.0 / self.LEAD), 0, 0.8)
+            grey = cv2.cvtColor(cv2.cvtColor(pix, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+            ashen = grey.astype(np.float32) * 0.35 + 0.65 * self.ASH
+            k3 = cv2.merge([k, k, k])
+            tinted = cv2.convertScaleAbs(cv2.multiply(pix, 1.0 - k3, dtype=cv2.CV_32F)
+                                         + cv2.multiply(ashen, k3))
+            roi = out[y0:y1, x0:x1]
+            roi[s] = tinted[s]
 
-        age = t_eff - self.t0
-        act = (age > 0) & (age < self.life)
-        if act.any():
-            a = age[act]
-            px = self.x0[act] + self.vx[act] * a + 0.5 * self.ax[act] * a * a \
-                + self.wobble[act] * np.sin(self.phase[act] + 7.0 * a)
-            py = self.y0[act] + self.vy[act] * a + 0.5 * self.ay[act] * a * a
-            frac = a / self.life
-            alpha = np.clip(1.0 - frac, 0, 1) ** 1.3
-            col = self.color[act] * (1 - 0.65 * frac[:, None]) + self.DUST_COLOR * (0.65 * frac[:, None])
-            pxi = px.astype(np.int32)
-            pyi = py.astype(np.int32)
-            for dy in range(self.size):
-                for dx in range(self.size):
-                    xx, yy = pxi + dx, pyi + dy
-                    ok = (xx >= 0) & (xx < self.w) & (yy >= 0) & (yy < self.h)
-                    if not ok.any():
-                        continue
-                    xo, yo, al, co = xx[ok], yy[ok], alpha[ok][:, None], col[ok]
-                    base = out[yo, xo].astype(np.float32)
-                    out[yo, xo] = (base * (1 - al) + co * al).astype(np.uint8)
+        parts = self._particles(t_eff)
+        if parts is not None:
+            px, py, col, alpha, flake = parts
+            hc, wc = self.h // 2, self.w // 2
+            cx = (px * 0.5).astype(np.int32)
+            cy = (py * 0.5).astype(np.int32)
+            ok = (cx >= 0) & (cx < wc - 1) & (cy >= 0) & (cy < hc - 1)
+            if ok.any():
+                cx, cy, col, alpha, flake = cx[ok], cy[ok], col[ok], alpha[ok], flake[ok]
+                bx0, bx1 = int(cx.min()), int(cx.max()) + 2
+                by0, by1 = int(cy.min()), int(cy.max()) + 2
+                cw, ch = bx1 - bx0, by1 - by0
+                acc = np.zeros((ch, cw, 3), np.float32)
+                al = np.zeros((ch, cw), np.float32)
+                lx, ly = cx - bx0, cy - by0
+                acc[ly, lx] = col * alpha[:, None]   # premultiplied: no dark halos
+                al[ly, lx] = alpha
+                fl = flake
+                for dy, dx in ((0, 1), (1, 0), (1, 1)):   # flakes are 2x2 on the half grid
+                    acc[ly[fl] + dy, lx[fl] + dx] = col[fl] * (alpha[fl, None] * 0.9)
+                    al[ly[fl] + dy, lx[fl] + dx] = alpha[fl] * 0.9
+                # Upscale with smoothing: soft, dusty edges.
+                acc = cv2.resize(acc, (cw * 2, ch * 2), interpolation=cv2.INTER_LINEAR)
+                al = cv2.resize(al, (cw * 2, ch * 2), interpolation=cv2.INTER_LINEAR)[..., None]
+                fy0, fx0 = by0 * 2, bx0 * 2
+                fy1, fx1 = min(self.h, fy0 + ch * 2), min(self.w, fx0 + cw * 2)
+                acc, al = acc[: fy1 - fy0, : fx1 - fx0], al[: fy1 - fy0, : fx1 - fx0]
+                inv = cv2.merge([1.0 - al[..., 0]] * 3)
+                blended = cv2.multiply(out[fy0:fy1, fx0:fx1], inv, dtype=cv2.CV_32F)
+                out[fy0:fy1, fx0:fx1] = cv2.convertScaleAbs(cv2.add(blended, acc))
         return out, done
 
 
@@ -718,6 +784,39 @@ class ZoomWatcher:
 # The app
 # ---------------------------------------------------------------------------
 
+class SpeedLog:
+    """Writes frame rate and processing time to the log, so slowness can be
+    diagnosed: every 15 seconds, and after every vanish or appear."""
+
+    def __init__(self, fps):
+        self.budget = 1000.0 / fps
+        self.reset(time.monotonic())
+        self.effect = []
+
+    def reset(self, now):
+        self.since, self.frames, self.work = now, 0, []
+
+    def frame(self, now, work_ms, in_effect):
+        self.frames += 1
+        self.work.append(work_ms)
+        if in_effect:
+            self.effect.append(work_ms)
+        if now - self.since >= 15:
+            w = np.array(self.work)
+            say(f"speed: {self.frames / (now - self.since):.1f} fps from the webcam, "
+                f"processing {w.mean():.1f} ms avg / {w.max():.1f} ms max "
+                f"(budget {self.budget:.0f} ms)")
+            self.reset(now)
+
+    def effect_done(self, name):
+        if self.effect:
+            e = np.array(self.effect)
+            slow = (e > self.budget).mean()
+            say(f"speed during {name}: {e.mean():.1f} ms avg, {np.percentile(e, 95):.1f} ms p95, "
+                f"{e.max():.1f} ms max, {slow:.0%} of frames over budget")
+        self.effect = []
+
+
 class App:
     SETTLE_FRAMES = 45  # let the webcam adjust exposure before matching a room
 
@@ -806,7 +905,7 @@ class App:
         use_dust = self.dust and now_mask.sum() > 0.005 * now_mask.size
         if self.dust and not use_dust:
             say("Could not find you in the frame, so no dust this time.")
-        self.effect = (Dissolve(frame, now_mask, direction, self.args.duration) if use_dust
+        self.effect = (Ash(frame, now_mask, direction, self.args.duration) if use_dust
                        else Crossfade(direction))
         self.state = "vanishing" if direction == "out" else "appearing"
         say("Vanishing..." if direction == "out" else "Appearing...")
@@ -891,7 +990,7 @@ def parse_args():
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--countdown", type=int, default=5, help="seconds before the room photo")
-    p.add_argument("--duration", type=float, default=2.6, help="dust animation length in seconds")
+    p.add_argument("--duration", type=float, default=4.0, help="ash animation length in seconds")
     p.add_argument("--threshold", type=int, default=26,
                    help="how different a pixel must be from the room to count as you (raise if the room "
                         "is grainy, lower if parts of you are missed)")
@@ -982,6 +1081,8 @@ def main():
                 watcher = ZoomWatcher()
             running = True
             failures = 0
+            speed = SpeedLog(args.fps)
+            was_effect = False
             while running:
                 ok, frame = cap.read()
                 if not ok:
@@ -1003,7 +1104,14 @@ def main():
                     app.wave.submit(frame)
                 while app.commands and running:
                     running = app.handle(app.commands.popleft(), frame)
-                cam.send(np.ascontiguousarray(app.process(frame)))
+                t_work = time.perf_counter()
+                result = app.process(frame)
+                in_effect = app.state in ("vanishing", "appearing")
+                cam.send(np.ascontiguousarray(result))
+                speed.frame(time.monotonic(), (time.perf_counter() - t_work) * 1000, in_effect)
+                if was_effect and not in_effect:
+                    speed.effect_done("vanish" if app.state == "vanished" else "appear")
+                was_effect = in_effect
                 if watcher is not None and watcher.zoom_closed(time.monotonic()):
                     say("Zoom closed, stopping Vanish Cam.")
                     running = False
