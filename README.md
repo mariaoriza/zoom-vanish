@@ -52,7 +52,7 @@ Secure Boot message, follow the printed steps (one reboot) and run it again.
 | Ctrl+Alt+V | vanish / appear |
 | Ctrl+Alt+C | capture the room for this place |
 
-setup.sh creates both shortcuts on GNOME. On other desktops, bind
+setup.sh creates both shortcuts on GNOME and XFCE. On other desktops, bind
 `~/.local/bin/zoom-vanish --toggle` and `--capture` yourself.
 `zoom-vanish --quit` stops it.
 
@@ -169,8 +169,9 @@ sudo rm /etc/modprobe.d/zoom-vanish.conf /etc/modules-load.d/zoom-vanish.conf
 sudo apt remove v4l2loopback-dkms v4l2loopback-utils
 ```
 
-Then delete the two "Zoom Vanish" shortcuts in Settings > Keyboard >
-View and Customize Shortcuts > Custom Shortcuts.
+Then delete the two shortcuts: on GNOME in Settings > Keyboard > View and
+Customize Shortcuts > Custom Shortcuts, on XFCE in Settings > Keyboard >
+Application Shortcuts.
 
 ## What it does and doesn't touch
 

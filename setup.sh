@@ -85,7 +85,7 @@ Terminal=false
 Categories=Network;VideoConference;
 EOF
 
-# Keyboard shortcuts (GNOME): Ctrl+Alt+V vanish/appear, Ctrl+Alt+C capture room.
+# Keyboard shortcuts (GNOME or XFCE): Ctrl+Alt+V vanish/appear, Ctrl+Alt+C capture room.
 MK=org.gnome.settings-daemon.plugins.media-keys
 add_shortcut() {  # id, name, command, binding
   local path="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/$1/"
@@ -108,8 +108,17 @@ if command -v gsettings >/dev/null && gsettings list-schemas 2>/dev/null | grep 
   add_shortcut zoom-vanish-capture "Zoom Vanish: capture room" \
     "$HOME/.local/bin/zoom-vanish --capture" "<Control><Alt>c"
   echo "    Shortcuts set: Ctrl+Alt+V (vanish/appear), Ctrl+Alt+C (capture room)"
+elif command -v xfconf-query >/dev/null; then
+  # XFCE: <Primary> means Ctrl. Set the value, creating the entry if needed.
+  for pair in "v|--toggle" "c|--capture"; do
+    key="/commands/custom/<Primary><Alt>${pair%%|*}"
+    cmd="$HOME/.local/bin/zoom-vanish ${pair##*|}"
+    xfconf-query -c xfce4-keyboard-shortcuts -p "$key" -s "$cmd" 2>/dev/null \
+      || xfconf-query -c xfce4-keyboard-shortcuts -p "$key" -n -t string -s "$cmd"
+  done
+  echo "    Shortcuts set (XFCE): Ctrl+Alt+V (vanish/appear), Ctrl+Alt+C (capture room)"
 else
-  echo "    Not GNOME, so set these shortcuts by hand in your desktop's keyboard settings:"
+  echo "    Not GNOME or XFCE, so set these shortcuts by hand in your desktop's keyboard settings:"
   echo "      $HOME/.local/bin/zoom-vanish --toggle    (vanish/appear)"
   echo "      $HOME/.local/bin/zoom-vanish --capture   (capture room)"
 fi
