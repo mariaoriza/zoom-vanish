@@ -28,49 +28,66 @@ Secure Boot message, follow the printed steps (one reboot) and run it again.
 
 ## Use
 
-1. **Start it before Zoom grabs your webcam** (only one program can use the
-   real camera):
+1. **Open "Zoom (Vanish)"** from your app menu. It turns on Vanish Cam and
+   opens Zoom. When you quit Zoom, Vanish Cam stops and the camera light goes
+   off. (If Zoom only hides to the tray when you close its window, use its
+   Quit option.)
 
-   ```
-   ~/.local/bin/zoom-vanish
-   ```
+2. **First time only:** in Zoom, Settings > Video > Camera > **Vanish Cam**.
+   Zoom remembers it. When you open plain Zoom instead, Vanish Cam doesn't
+   exist and Zoom falls back to your normal webcam.
 
-   If your webcam isn't `/dev/video0`, pass it: `zoom-vanish --camera /dev/video2`
-   (`v4l2-ctl --list-devices` lists them).
+3. **Room photos are per place.** After about a second and a half (time for
+   the webcam to adjust its exposure), it compares what the camera sees with
+   your saved room photos and uses the matching one. If none matches, a
+   notification asks you to press **Ctrl+Alt+C** and step out of frame during
+   the 5-second countdown. Best done before joining a call, since people would
+   see you walk away. Capturing again in the same place replaces that place's
+   old photo.
 
-2. **In Zoom:** Settings > Video > Camera > **Vanish Cam**.
+4. **Vanish:** wave goodbye, or press **Ctrl+Alt+V**. Same again to come back.
 
-3. **Capture the empty room:** press `c` in the terminal and step out of frame
-   during the 5-second countdown. Best done before joining the call, since
-   people would see you walk away. The photo is saved and reused next time.
-   Retake it if you move the camera or the light changes (lamp on/off, sunset).
+| Shortcut | Action |
+|---|---|
+| Ctrl+Alt+V | vanish / appear |
+| Ctrl+Alt+C | capture the room for this place |
 
-4. **Vanish:** press `v` (or space). Press again to reappear.
+setup.sh creates both shortcuts on GNOME. On other desktops, bind
+`~/.local/bin/zoom-vanish --toggle` and `--capture` yourself.
+`zoom-vanish --quit` stops it.
+
+Messages appear as desktop notifications; details go to
+`~/.local/share/zoom-vanish/zoom-vanish.log`.
+
+### Zoom virtual backgrounds and filters
+
+Zoom applies its own effects on top of whatever Vanish Cam sends, so you can
+keep using them. With a virtual background on, vanishing leaves just the
+virtual background, and the room photo never shows. During the dust
+animation, Zoom's background detection may handle the particles unevenly.
+Check it in Zoom's video preview first.
+
+### Running it from a terminal
+
+For testing or tuning, run `~/.local/bin/zoom-vanish --wave` (Zoom closed
+first, so the webcam is free). Then these keys work in the terminal:
 
 | Key | Action |
 |---|---|
-| `c` | capture the empty room |
+| `c` | capture the room |
 | `v` / space | vanish / appear |
 | `d` | dust effect on / off |
 | `w` | goodbye-wave detection on / off |
 | `s` | finger-snap detection on / off |
 | `q` | quit |
 
-### A shortcut that works while Zoom is focused
-
-The keys above only work while the terminal is focused. For a shortcut that
-works anywhere, GNOME Settings > Keyboard > View and Customize Shortcuts >
-Custom Shortcuts > add one:
-
-- Name: `Vanish`
-- Command: `/home/YOURUSER/.local/bin/zoom-vanish --toggle`
-- Shortcut: for example Alt+Shift+V
-
-(`--capture` works the same way for the room photo.)
+If your webcam isn't `/dev/video0`, add `--camera /dev/video2`
+(`v4l2-ctl --list-devices` lists them). To make the menu entry use it too,
+edit the `Exec=` line in `~/.local/share/applications/zoom-vanish.desktop`.
 
 ### Waving goodbye
 
-Start with `zoom-vanish --wave`, or press `w`. Wave at the camera like saying
+On by default from the menu entry. Wave at the camera like saying
 goodbye: open hand, raised (not down by the desk), swinging left and right
 at least three times. Wave again to come back. One long wave only counts
 once; it re-arms after you stop.
@@ -115,8 +132,9 @@ differs is you. That keeps it fast and offline, with these limits:
 
 - Parts of you the same color as the wall behind you get no dust (they still
   disappear, just without particles).
-- If the camera moves or the lighting changes after the room photo, it may not
-  find you, and falls back to a plain fade. Retake the photo.
+- If the camera moves or the lighting changes a lot after the room photo, it
+  may not find you, and falls back to a plain fade. Press Ctrl+Alt+C to
+  update that place's photo.
 - Webcam auto-exposure can shift the whole image when you leave the frame. If
   the room photo looks brighter or darker than the live picture, lock
   exposure: `v4l2-ctl -d /dev/video0 --list-ctrls` shows the names; usually
@@ -134,18 +152,31 @@ Turn triggers on at start with `--wave` and/or `--snap`. Others: `--width/--heig
 `--width 960 --height 540` if the dust animation stutters), `--duration`
 (dust length, default 2.6 s), `--countdown`, `--no-dust`.
 
+### How it recognises a place
+
+It compares the top of the picture and the left and right edges (where
+background shows even with you sitting there) with each saved photo, after
+evening out brightness. Two places that look nearly identical, such as two
+plain walls of the same color, can be mistaken for each other. Up to 20 places
+are kept; the oldest is forgotten after that.
+
 ## Uninstall
 
 ```
 rm -rf ~/.local/share/zoom-vanish ~/.local/bin/zoom-vanish
+rm ~/.local/share/applications/zoom-vanish.desktop
 sudo rm /etc/modprobe.d/zoom-vanish.conf /etc/modules-load.d/zoom-vanish.conf
 sudo apt remove v4l2loopback-dkms v4l2loopback-utils
 ```
 
+Then delete the two "Zoom Vanish" shortcuts in Settings > Keyboard >
+View and Customize Shortcuts > Custom Shortcuts.
+
 ## What it does and doesn't touch
 
-Everything runs on your computer. No network access, no accounts. The room
-photo is stored at `~/.local/share/zoom-vanish/room.png`. The microphone is
+Everything runs on your computer. No network access, no accounts. Room
+photos are stored in `~/.local/share/zoom-vanish/rooms/`, readable only by
+your user. The microphone is
 only opened when snap detection is on. Wave detection only looks at the
 webcam picture the program already has; the hand model is downloaded once by
 setup.sh from Google and then runs offline.

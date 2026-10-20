@@ -7,6 +7,10 @@ vanish, the virtual camera shows a still photo of your empty room (with a
 little sensor grain so it does not look frozen). Optionally you dissolve into
 dust on the way out and reassemble on the way back.
 
+Normal use: open "Zoom (Vanish)" from the app menu. It starts the virtual
+camera and Zoom together and stops when you quit Zoom. A room photo is kept
+for each place you use it and picked automatically.
+
 Controls while running in a terminal:
   c   capture the empty room (countdown, then step out of frame)
   v   vanish / appear
@@ -15,9 +19,10 @@ Controls while running in a terminal:
   s   finger-snap detection on / off
   q   quit
 
-From anywhere (bind these to keyboard shortcuts in GNOME Settings):
+From anywhere (setup.sh binds the first two to Ctrl+Alt+V and Ctrl+Alt+C):
   zoom-vanish --toggle     vanish / appear
-  zoom-vanish --capture    capture the empty room
+  zoom-vanish --capture    capture the empty room for this place
+  zoom-vanish --quit       stop
 """
 
 import argparse
@@ -53,13 +58,21 @@ def send_remote(sig):
     pid = running_pid()
     if pid is None:
         print("Zoom Vanish is not running.", file=sys.stderr)
+        try:  # from a keyboard shortcut there is no terminal, so say it on screen
+            import subprocess
+            subprocess.Popen(["notify-send", "--app-name=Zoom Vanish", "--icon=camera-web",
+                              "--transient", "Zoom Vanish is not running",
+                              "Open Zoom (Vanish) from the app menu."],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
         return 1
     os.kill(pid, sig)
     return 0
 
 
 if __name__ == "__main__":
-    _remote = {"--toggle": signal.SIGUSR1, "--capture": signal.SIGUSR2}
+    _remote = {"--toggle": signal.SIGUSR1, "--capture": signal.SIGUSR2, "--quit": signal.SIGTERM}
     for _flag, _sig in _remote.items():
         if _flag in sys.argv[1:]:
             sys.exit(send_remote(_sig))
@@ -461,10 +474,10 @@ class HandWatcher(threading.Thread):
             if frame is not None:
                 try:
                     if self.detector.add(t, self.analyse(frame, t)):
-                        print("Wave detected.")
+                        say("Wave detected.")
                         self.on_wave()
                 except Exception as exc:
-                    print(f"Wave detection stopped: {exc}")
+                    say("Wave detection stopped", popup=True, body=str(exc))
                     return
             self.stop_event.wait(max(0.0, self.period - (time.monotonic() - t)))
 
@@ -531,14 +544,192 @@ class KeyReader(threading.Thread):
             termios.tcsetattr(fd, termios.TCSADRAIN, self.saved)
 
 
+# ---------------------------------------------------------------------------
+# Notifications and logging (so it can run without a terminal)
+# ---------------------------------------------------------------------------
+
+LOG_PATH = DATA_DIR / "zoom-vanish.log"
+
+
+def notify(title, body=""):
+    """Show a desktop notification. Silently does nothing if unavailable."""
+    import subprocess
+    try:
+        subprocess.Popen(["notify-send", "--app-name=Zoom Vanish", "--icon=camera-web",
+                          "--expire-time=4000", "--transient", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def say(msg, popup=False, body=""):
+    """Print (to the terminal or the log file) and optionally pop up a notification."""
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+    if popup:
+        notify(msg, body)
+
+
+def make_private_dir(path):
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)  # room photos show your home: keep them to yourself
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Room photos: one per place, picked automatically
+# ---------------------------------------------------------------------------
+
+ROOMS_DIR = DATA_DIR / "rooms"
+MATCH_OK = 0.6        # share of background pixels that must agree with a room photo
+SAME_PLACE = 0.85     # a new photo this similar to an old one replaces it
+MAX_ROOMS = 20
+
+
+def room_signature(img):
+    small = cv2.resize(img, (160, 90), interpolation=cv2.INTER_AREA)
+    return cv2.GaussianBlur(small, (0, 0), 1.0).astype(np.float32)
+
+
+def _background_band(shape):
+    """Where background usually shows even when you sit in front of the camera:
+    the top of the picture and the outer left and right strips."""
+    h, w = shape[:2]
+    band = np.zeros((h, w), dtype=bool)
+    band[: int(h * 0.3), :] = True
+    band[:, : int(w * 0.2)] = True
+    band[:, int(w * 0.8):] = True
+    return band
+
+
+_BAND = _background_band((90, 160))
+
+
+def agreement(sig_a, sig_b):
+    """How much of the background band looks the same in both pictures (0 to 1),
+    after evening out overall brightness so a lamp or auto-exposure change does
+    not count as a different place."""
+    gain = float(sig_a[_BAND].mean()) / max(1.0, float(sig_b[_BAND].mean()))
+    b = np.clip(sig_b * gain, 0, 255)
+    d = np.abs(sig_a - b).max(axis=2)
+    return float((d[_BAND] < 30).mean())
+
+
+class RoomLibrary:
+    def __init__(self, width, height):
+        self.w, self.h = width, height
+        make_private_dir(DATA_DIR)
+        make_private_dir(ROOMS_DIR)
+        if ROOM_PATH.exists():  # photo from the first version: keep it as a place
+            ROOM_PATH.rename(ROOMS_DIR / "room-first.png")
+        self.rooms = {}
+        for path in sorted(ROOMS_DIR.glob("*.png")):
+            img = cv2.imread(str(path))
+            if img is not None:
+                self.rooms[path] = room_signature(img)
+
+    def best(self, frame):
+        """(path, score) of the photo that best matches what the camera sees."""
+        sig = room_signature(frame)
+        scored = [(agreement(sig, r), p) for p, r in self.rooms.items()]
+        if not scored:
+            return None, 0.0
+        score, path = max(scored)
+        return path, score
+
+    def image(self, path):
+        img = cv2.imread(str(path))
+        if img is not None and (img.shape[1] != self.w or img.shape[0] != self.h):
+            img = cv2.resize(img, (self.w, self.h), interpolation=cv2.INTER_AREA)
+        return img
+
+    def add(self, room):
+        """Save a new photo, replacing an older one of the same place."""
+        sig = room_signature(room)
+        same = [p for p, r in self.rooms.items() if agreement(sig, r) >= SAME_PLACE]
+        for p in same:
+            p.unlink(missing_ok=True)
+            del self.rooms[p]
+        path = ROOMS_DIR / f"room-{time.strftime('%Y%m%d-%H%M%S')}.png"
+        cv2.imwrite(str(path), room)
+        os.chmod(path, 0o600)
+        self.rooms[path] = sig
+        while len(self.rooms) > MAX_ROOMS:  # forget the oldest place
+            oldest = min(self.rooms, key=lambda q: q.stat().st_mtime)
+            oldest.unlink(missing_ok=True)
+            del self.rooms[oldest]
+        return path, bool(same)
+
+
+# ---------------------------------------------------------------------------
+# Zoom launching
+# ---------------------------------------------------------------------------
+
+ZOOM_PROCESS_NAMES = {"zoom", "ZoomLauncher", "ZoomWebviewHost", "zoom.real"}
+
+
+def zoom_running():
+    for comm in Path("/proc").glob("[0-9]*/comm"):
+        try:
+            if comm.read_text().strip() in ZOOM_PROCESS_NAMES:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def launch_zoom():
+    import shutil
+    import subprocess
+    exe = shutil.which("zoom") or ("/usr/bin/zoom" if os.path.exists("/usr/bin/zoom") else None)
+    if exe is None:
+        return False
+    subprocess.Popen([exe], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+
+class ZoomWatcher:
+    """In --with-zoom mode: notices when Zoom has been closed."""
+
+    def __init__(self, start_grace=90.0, gone_after=5.0):
+        self.started = time.monotonic()
+        self.seen = False
+        self.last_seen = None
+        self.next_check = 0.0
+        self.start_grace = start_grace
+        self.gone_after = gone_after
+
+    def zoom_closed(self, now, running=None):
+        if now < self.next_check:
+            return False
+        self.next_check = now + 2.0
+        running = zoom_running() if running is None else running
+        if running:
+            self.seen, self.last_seen = True, now
+            return False
+        if self.seen:
+            return now - self.last_seen > self.gone_after
+        return now - self.started > self.start_grace  # Zoom never came up
+
+
+# ---------------------------------------------------------------------------
+# The app
+# ---------------------------------------------------------------------------
+
 class App:
-    def __init__(self, args):
+    SETTLE_FRAMES = 45  # let the webcam adjust exposure before matching a room
+
+    def __init__(self, args, width, height):
         self.args = args
         self.commands = deque()
         self.state = "live"         # live, countdown, capturing, vanishing, vanished, appearing
         self.effect = None
         self.dust = not args.no_dust
+        self.library = RoomLibrary(width, height)
         self.room = None
+        self.room_path = None
         self.room_blur = None
         self.grain = []
         self.grain_i = 0
@@ -547,23 +738,32 @@ class App:
         self.last_count = None
         self.snap = None
         self.wave = None
+        self.frames_seen = 0
+        self.matched_once = False
 
     # -- room ---------------------------------------------------------------
-    def set_room(self, room):
+    def set_room(self, room, path=None):
         self.room = room
+        self.room_path = path
         self.room_blur = blur_for_mask(room)
         self.grain = make_grain_frames(room)
 
-    def load_room(self, w, h):
-        if ROOM_PATH.exists():
-            img = cv2.imread(str(ROOM_PATH))
-            if img is not None:
-                if img.shape[1] != w or img.shape[0] != h:
-                    img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
-                self.set_room(img)
-                print(f"Loaded saved empty-room photo ({ROOM_PATH}). Press c to retake it.")
-                return
-        print("No empty-room photo yet. Press c, then step out of frame during the countdown.")
+    def pick_room(self, frame, at_startup=False):
+        """Use the saved photo of this place. Returns True if one matched."""
+        path, score = self.library.best(frame)
+        if path is not None and score >= MATCH_OK:
+            if path != self.room_path:
+                self.set_room(self.library.image(path), path)
+                say(f"Using room photo {path.name} (match {score:.0%}).")
+            return True
+        if at_startup:
+            if not self.library.rooms:
+                say("No room photo yet.", popup=True,
+                    body="Press Ctrl+Alt+C, then step out of frame for the countdown.")
+            else:
+                say(f"New place? Best saved photo only matches {score:.0%}.", popup=True,
+                    body="Press Ctrl+Alt+C and step out of frame to capture this room.")
+        return False
 
     def room_frame(self):
         self.grain_i = (self.grain_i + 1) % len(self.grain)
@@ -575,7 +775,7 @@ class App:
             return False
         if cmd == "dust":
             self.dust = not self.dust
-            print(f"Dust effect {'ON' if self.dust else 'OFF'}")
+            say(f"Dust effect {'ON' if self.dust else 'OFF'}")
         elif cmd == "snap":
             self.toggle_snap()
         elif cmd == "wave":
@@ -585,27 +785,31 @@ class App:
                 self.state = "countdown"
                 self.countdown_end = time.monotonic() + self.args.countdown
                 self.last_count = None
-                print(f"Capturing the empty room in {self.args.countdown} s. Step out of frame now.")
+                say(f"Capturing the room in {self.args.countdown} seconds", popup=True,
+                    body="Step out of frame now.")
         elif cmd == "toggle":
             self.toggle(frame)
         return True
 
     def toggle(self, frame):
-        if self.room is None:
-            print("Capture the empty room first (press c).")
-            return
         if self.state in ("vanishing", "appearing", "countdown", "capturing"):
             return  # ignore while a transition is running
+        if self.state == "live" and not self.pick_room(frame):
+            if self.room is None:
+                say("Can't vanish yet: no room photo for this place.", popup=True,
+                    body="Press Ctrl+Alt+C and step out of frame first.")
+                return
+            say("The room photo doesn't match this place well.", popup=True,
+                body="Vanishing anyway. Capture a new one with Ctrl+Alt+C.")
         now_mask = person_mask(frame, self.room_blur, self.args.threshold)
         direction = "out" if self.state == "live" else "in"
         use_dust = self.dust and now_mask.sum() > 0.005 * now_mask.size
         if self.dust and not use_dust:
-            print("Could not find you in the frame, so no dust this time "
-                  "(lighting changed? camera moved? try retaking the room photo).")
+            say("Could not find you in the frame, so no dust this time.")
         self.effect = (Dissolve(frame, now_mask, direction, self.args.duration) if use_dust
                        else Crossfade(direction))
         self.state = "vanishing" if direction == "out" else "appearing"
-        print("Vanishing..." if direction == "out" else "Appearing...")
+        say("Vanishing..." if direction == "out" else "Appearing...")
 
     def toggle_snap(self):
         if self.snap is None:
@@ -613,14 +817,14 @@ class App:
                 self.snap = SnapDetector(lambda: self.commands.append("toggle"),
                                          self.args.snap_sensitivity, self.args.snap_debug)
                 self.snap.start()
-                print("Snap detection ON (snap your fingers near the mic).")
+                say("Snap detection ON")
             except Exception as exc:  # missing sounddevice or no microphone
                 self.snap = None
-                print(f"Snap detection unavailable: {exc}")
+                say("Snap detection unavailable", popup=True, body=str(exc))
         else:
             self.snap.stop()
             self.snap = None
-            print("Snap detection OFF")
+            say("Snap detection OFF")
 
     def toggle_wave(self):
         if self.wave is None:
@@ -628,22 +832,28 @@ class App:
                 self.wave = HandWatcher(lambda: self.commands.append("toggle"),
                                         self.args.wave_sensitivity, self.args.wave_debug)
                 self.wave.start()
-                print("Wave detection ON (wave goodbye with an open hand to vanish, wave again to come back).")
+                say("Wave detection ON")
             except Exception as exc:  # mediapipe or the hand model missing
                 self.wave = None
-                print(f"Wave detection unavailable: {exc}")
+                say("Wave detection unavailable", popup=True,
+                    body=f"{exc}. Ctrl+Alt+V still works.")
         else:
             self.wave.stop()
             self.wave = None
-            print("Wave detection OFF")
+            say("Wave detection OFF")
 
     # -- per frame ------------------------------------------------------------
     def process(self, frame):
         now = time.monotonic()
+        self.frames_seen += 1
+        if not self.matched_once and self.frames_seen >= self.SETTLE_FRAMES:
+            self.matched_once = True
+            if self.state == "live":
+                self.pick_room(frame, at_startup=True)
         if self.state == "countdown":
             left = int(np.ceil(self.countdown_end - now))
             if left != self.last_count and left > 0:
-                print(f"  {left}...")
+                say(f"  {left}...")
                 self.last_count = left
             if now >= self.countdown_end:
                 self.state = "capturing"
@@ -653,12 +863,12 @@ class App:
             self.capture_buf.append(frame.astype(np.float32))
             if len(self.capture_buf) >= 20:
                 room = np.mean(self.capture_buf, axis=0).astype(np.uint8)
-                self.set_room(room)
-                DATA_DIR.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(ROOM_PATH), room)
+                path, replaced = self.library.add(room)
+                self.set_room(room, path)
                 self.capture_buf = []
                 self.state = "live"
-                print("Empty room captured. You can come back. Press v (or snap) to vanish.")
+                say("Room captured" + (" (updated this place)" if replaced else " (new place saved)"),
+                    popup=True, body="You can come back now. Wave goodbye or press Ctrl+Alt+V to vanish.")
             return frame
         if self.state == "vanished":
             return self.room_frame()
@@ -668,7 +878,7 @@ class App:
             if done:
                 self.effect = None
                 self.state = "vanished" if self.state == "vanishing" else "live"
-                print("Gone." if self.state == "vanished" else "Back.")
+                say("Gone." if self.state == "vanished" else "Back.")
             return out
         return frame
 
@@ -693,45 +903,54 @@ def parse_args():
     p.add_argument("--wave-sensitivity", type=float, default=1.0,
                    help="higher = smaller waves count")
     p.add_argument("--wave-debug", action="store_true", help="print wave detector details")
+    p.add_argument("--with-zoom", action="store_true",
+                   help="start Zoom too, and stop when Zoom is closed (used by the menu entry)")
     p.add_argument("--toggle", action="store_true", help="vanish/appear in the running instance")
     p.add_argument("--capture", action="store_true", help="capture the room in the running instance")
+    p.add_argument("--quit", action="store_true", help="stop the running instance")
     return p.parse_args()
+
+
+def fail(msg, body=""):
+    say(msg, popup=True, body=body)
+    return 1
 
 
 def main():
     args = parse_args()
+    make_private_dir(DATA_DIR)
+    if not sys.stdout.isatty():
+        # Started from the menu: keep a log instead of printing to nowhere.
+        log = open(LOG_PATH, "a", buffering=1)
+        sys.stdout = sys.stderr = log
+    say("---- starting")
+
+    if running_pid() is not None:
+        if args.with_zoom:
+            launch_zoom()  # camera already running: just open Zoom
+            return 0
+        return fail("Zoom Vanish is already running.")
     try:
         import pyvirtualcam
     except ImportError:
-        print("pyvirtualcam is not installed. Run setup.sh first.", file=sys.stderr)
-        return 1
-
+        return fail("Zoom Vanish isn't installed properly", "Run setup.sh again.")
     if not os.path.exists(args.output):
-        print(f"{args.output} does not exist. Is v4l2loopback loaded? (sudo modprobe v4l2loopback)",
-              file=sys.stderr)
-        return 1
+        return fail("Vanish Cam is missing", f"{args.output} doesn't exist. Reboot, or run setup.sh again.")
     if os.path.realpath(args.camera) == os.path.realpath(args.output):
-        print("--camera and --output are the same device.", file=sys.stderr)
-        return 1
-    if running_pid() is not None:
-        print("Zoom Vanish is already running.", file=sys.stderr)
-        return 1
+        return fail("--camera and --output are the same device.")
 
     cap = open_camera(args.camera, args.width, args.height, args.fps)
-    if cap is None:
-        print(f"Could not open {args.camera}. Close Zoom (or anything else using the webcam) and retry, "
-              "or list cameras with: v4l2-ctl --list-devices", file=sys.stderr)
-        return 1
-    ok, frame = cap.read()
+    ok, frame = (cap.read() if cap is not None else (False, None))
     if not ok:
-        print("The webcam opened but returned no image.", file=sys.stderr)
-        return 1
+        if args.with_zoom and zoom_running():
+            return fail("Zoom is already using the webcam",
+                        "Quit Zoom completely, then open Zoom (Vanish) again.")
+        return fail("Could not open the webcam",
+                    f"{args.camera} is busy or missing. Close other video apps and try again.")
 
     w, h = args.width, args.height
-    app = App(args)
-    app.load_room(w, h)
+    app = App(args, w, h)
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     PID_PATH.write_text(str(os.getpid()))
     signal.signal(signal.SIGUSR1, lambda *_: app.commands.append("toggle"))
     signal.signal(signal.SIGUSR2, lambda *_: app.commands.append("capture"))
@@ -741,21 +960,27 @@ def main():
     if sys.stdin.isatty():
         keys = KeyReader(app.commands)
         keys.start()
+        print("Controls" + __doc__.split("Controls", 1)[1])
     if args.snap:
         app.toggle_snap()
     if args.wave:
         app.toggle_wave()
 
-    print("Controls" + __doc__.split("Controls", 1)[1])
+    watcher = None
     try:
         with pyvirtualcam.Camera(width=w, height=h, fps=args.fps, device=args.output,
                                  fmt=pyvirtualcam.PixelFormat.BGR) as cam:
-            print(f"Virtual camera running on {cam.device}. In Zoom choose it under Settings > Video > Camera.")
+            cam.send(np.ascontiguousarray(frame))  # Vanish Cam is now visible to apps
+            say(f"Virtual camera running on {cam.device}.")
+            if args.with_zoom:
+                if not zoom_running() and not launch_zoom():
+                    raise RuntimeError("Zoom is not installed (no 'zoom' command found).")
+                watcher = ZoomWatcher()
             running = True
             while running:
                 ok, frame = cap.read()
                 if not ok:
-                    print("Lost the webcam signal.", file=sys.stderr)
+                    say("Lost the webcam signal.", popup=True)
                     break
                 if frame.shape[1] != w or frame.shape[0] != h:
                     frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
@@ -764,8 +989,13 @@ def main():
                 while app.commands and running:
                     running = app.handle(app.commands.popleft(), frame)
                 cam.send(np.ascontiguousarray(app.process(frame)))
+                if watcher is not None and watcher.zoom_closed(time.monotonic()):
+                    say("Zoom closed, stopping Vanish Cam.")
+                    running = False
     except KeyboardInterrupt:
         pass
+    except Exception as exc:
+        say(f"Stopped because of an error: {exc}", popup=True)
     finally:
         if keys is not None:
             keys.stop_event.set()
@@ -779,7 +1009,7 @@ def main():
             PID_PATH.unlink()
         except OSError:
             pass
-        print("Stopped.")
+        say("Stopped.")
     return 0
 
 

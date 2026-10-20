@@ -23,7 +23,7 @@ fi
 echo "==> 1/5 Installing system packages"
 sudo apt update
 sudo apt install -y v4l2loopback-dkms v4l2loopback-utils v4l-utils \
-  "linux-headers-$(uname -r)" python3-venv libportaudio2 curl
+  "linux-headers-$(uname -r)" python3-venv libportaudio2 curl libnotify-bin
 
 echo "==> 2/5 Configuring the virtual camera (/dev/video$VIDEO_NR, named \"Vanish Cam\")"
 echo "options v4l2loopback devices=1 video_nr=$VIDEO_NR card_label=\"Vanish Cam\" exclusive_caps=1" \
@@ -63,17 +63,60 @@ else
   echo "    Run setup.sh again later to retry."
 fi
 
-echo "==> 5/5 Installing the program as 'zoom-vanish'"
+echo "==> 5/5 Installing the program, menu entry and shortcuts"
 install -m 755 "$HERE/zoom_vanish.py" "$APP_DIR/app/zoom_vanish.py"
 cat > "$HOME/.local/bin/zoom-vanish" <<EOF
 #!/bin/sh
 exec "$VENV/bin/python" "$APP_DIR/app/zoom_vanish.py" "\$@"
 EOF
 chmod +x "$HOME/.local/bin/zoom-vanish"
+chmod 700 "$APP_DIR"
+
+# Menu entry: starts the virtual camera together with Zoom, stops when Zoom quits.
+mkdir -p "$HOME/.local/share/applications"
+cat > "$HOME/.local/share/applications/zoom-vanish.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Zoom (Vanish)
+Comment=Zoom with the Vanish Cam: wave goodbye or press Ctrl+Alt+V to disappear
+Exec=$HOME/.local/bin/zoom-vanish --with-zoom --wave
+Icon=Zoom
+Terminal=false
+Categories=Network;VideoConference;
+EOF
+
+# Keyboard shortcuts (GNOME): Ctrl+Alt+V vanish/appear, Ctrl+Alt+C capture room.
+MK=org.gnome.settings-daemon.plugins.media-keys
+add_shortcut() {  # id, name, command, binding
+  local path="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/$1/"
+  local list
+  list="$(gsettings get $MK custom-keybindings)"
+  if [[ "$list" != *"$path"* ]]; then
+    list="$(python3 -c 'import ast, sys
+l = ast.literal_eval(sys.argv[1].replace("@as ", ""))
+l.append(sys.argv[2])
+print(l)' "$list" "$path")"
+    gsettings set $MK custom-keybindings "$list"
+  fi
+  gsettings set "$MK.custom-keybinding:$path" name "$2"
+  gsettings set "$MK.custom-keybinding:$path" command "$3"
+  gsettings set "$MK.custom-keybinding:$path" binding "$4"
+}
+if command -v gsettings >/dev/null && gsettings list-schemas 2>/dev/null | grep -qx "$MK"; then
+  add_shortcut zoom-vanish-toggle "Zoom Vanish: vanish / appear" \
+    "$HOME/.local/bin/zoom-vanish --toggle" "<Control><Alt>v"
+  add_shortcut zoom-vanish-capture "Zoom Vanish: capture room" \
+    "$HOME/.local/bin/zoom-vanish --capture" "<Control><Alt>c"
+  echo "    Shortcuts set: Ctrl+Alt+V (vanish/appear), Ctrl+Alt+C (capture room)"
+else
+  echo "    Not GNOME, so set these shortcuts by hand in your desktop's keyboard settings:"
+  echo "      $HOME/.local/bin/zoom-vanish --toggle    (vanish/appear)"
+  echo "      $HOME/.local/bin/zoom-vanish --capture   (capture room)"
+fi
 
 echo
 echo "Cameras on this computer:"
 v4l2-ctl --list-devices || true
 echo
-echo "Done. Start it with:  $HOME/.local/bin/zoom-vanish"
-echo "(Just 'zoom-vanish' works after your next login, once ~/.local/bin is on your PATH.)"
+echo "Done. Open \"Zoom (Vanish)\" from your app menu."
+echo "The first time, choose Vanish Cam in Zoom: Settings > Video > Camera."
