@@ -955,6 +955,10 @@ def main():
     signal.signal(signal.SIGUSR1, lambda *_: app.commands.append("toggle"))
     signal.signal(signal.SIGUSR2, lambda *_: app.commands.append("capture"))
     signal.signal(signal.SIGTERM, lambda *_: app.commands.append("quit"))
+    for sig in (signal.SIGUSR1, signal.SIGUSR2, signal.SIGTERM):
+        # Resume the webcam read after a shortcut's signal instead of failing it
+        # ("Interrupted system call"), which used to stop the program.
+        signal.siginterrupt(sig, False)
 
     keys = None
     if sys.stdin.isatty():
@@ -977,11 +981,22 @@ def main():
                     raise RuntimeError("Zoom is not installed (no 'zoom' command found).")
                 watcher = ZoomWatcher()
             running = True
+            failures = 0
             while running:
                 ok, frame = cap.read()
                 if not ok:
-                    say("Lost the webcam signal.", popup=True)
-                    break
+                    # A dropped frame is not the end: retry, then reopen the webcam.
+                    failures += 1
+                    if failures == 15:
+                        say("Webcam stopped answering, reopening it.")
+                        cap.release()
+                        cap = open_camera(args.camera, w, h, args.fps) or cap
+                    elif failures >= 45:
+                        say("Lost the webcam signal.", popup=True)
+                        break
+                    time.sleep(0.02)
+                    continue
+                failures = 0
                 if frame.shape[1] != w or frame.shape[0] != h:
                     frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
                 if app.wave is not None:
